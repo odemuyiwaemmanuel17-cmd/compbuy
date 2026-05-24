@@ -1,0 +1,1265 @@
+
+'use strict';
+
+const { Pool } = require('pg');
+const logger   = require('../utils/logger');
+
+const pool = new Pool({
+  host:     process.env.DB_HOST     || 'localhost',
+  port:     parseInt(process.env.DB_PORT || '5432', 10),
+  database: process.env.DB_NAME     || 'compbuy_db',
+  user:     process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  ssl:      process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  max:                20,
+  idleTimeoutMillis:  30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('connect', () => logger.debug('PostgreSQL: new client connected'));
+pool.on('error',  (err) => {
+  logger.error('PostgreSQL pool error', { error: err.message });
+  process.exit(1);
+});
+
+/**
+ * Execute a single parameterised query.
+ * @param {string} text   - SQL statement
+ * @param {Array}  params - Bound parameters
+ */
+async function query(text, params) {
+  const start = Date.now();
+  const res   = await pool.query(text, params);
+  const ms    = Date.now() - start;
+  logger.debug('Executed query', { text, ms, rows: res.rowCount });
+  return res;
+}
+
+/**
+ * Obtain a dedicated client for multi-statement transactions.
+ * Always call client.release() in a finally block.
+ */
+async function getClient() {
+  const client = await pool.connect();
+  const origQuery   = client.query.bind(client);
+  const origRelease = client.release.bind(client);
+  const timeout = setTimeout(() => {
+    logger.error('Client checked out for >30 s — possible leak');
+  }, 30000);
+  client.release = () => { clearTimeout(timeout); origRelease(); };
+  client.query   = (...args) => {
+    logger.debug('Client query', { text: args[0] });
+    return origQuery(...args);
+  };
+  return client;
+}
+
+module.exports = { query, getClient, pool };
+
+'use strict';
+
+const nodemailer = require('nodemailer');
+const logger     = require('./logger');
+
+const transporter = nodemailer.createTransport({
+  host:   process.env.SMTP_HOST,
+  port:   parseInt(process.env.SMTP_PORT || '587', 10),
+  secure: process.env.SMTP_PORT === '465',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+const FROM = process.env.EMAIL_FROM || 'Compbuy <noreply@compbuy.ng>';
+const FE   = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+async function sendMail({ to, subject, html }) {
+  try {
+    const info = await transporter.sendMail({ from: FROM, to, subject, html });
+    logger.info('Email sent', { messageId: info.messageId, to, subject });
+    return info;
+  } catch (err) {
+    logger.error('Failed to send email', { error: err.message, to, subject });
+    throw err;
+  }
+}
+
+const base = (content) => `
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+  <div style="background:#0f172a;padding:20px 32px;border-radius:8px 8px 0 0;">
+    <h1 style="color:#c9a84c;margin:0;font-size:22px;letter-spacing:-0.5px;">Compbuy</h1>
+    <p style="color:rgba(255,255,255,0.5);margin:4px 0 0;font-size:12px;">Nigeria's Business Marketplace</p>
+  </div>
+  <div style="padding:32px;background:#f8f8f6;border-radius:0 0 8px 8px;">${content}</div>
+  <p style="text-align:center;color:#94a3b8;font-size:11px;padding:16px;">
+    © ${new Date().getFullYear()} Compbuy · Lagos, Nigeria
+  </p>
+</div>`;
+
+const btn = (url, text) =>
+  `<a href="${url}" style="display:inline-block;background:#c9a84c;color:#0f172a;padding:12px 24px;border-radius:8px;font-weight:700;text-decoration:none;margin-top:16px;">${text}</a>`;
+
+module.exports = {
+  sendVerificationEmail: (user, token) =>
+    sendMail({
+      to:      user.email,
+      subject: 'Verify your Compbuy email address',
+      html:    base(`
+        <h2 style="color:#0f172a;">Welcome, ${user.first_name}!</h2>
+        <p style="color:#334155;">Please verify your email to activate your Compbuy account.</p>
+        ${btn(`${FE}/verify-email?token=${token}`, 'Verify Email Address')}
+        <p style="color:#94a3b8;font-size:12px;margin-top:24px;">This link expires in 24 hours.</p>
+      `),
+    }),
+
+  sendPasswordResetEmail: (user, token) =>
+    sendMail({
+      to:      user.email,
+      subject: 'Reset your Compbuy password',
+      html:    base(`
+        <h2 style="color:#0f172a;">Password Reset Request</h2>
+        <p style="color:#334155;">Hi ${user.first_name}, we received a request to reset your password.</p>
+        ${btn(`${FE}/reset-password?token=${token}`, 'Reset Password')}
+        <p style="color:#94a3b8;font-size:12px;margin-top:24px;">
+          This link expires in 1 hour. If you didn't request this, please ignore this email.
+        </p>
+      `),
+    }),
+
+  sendInquiryNotification: (seller, buyer, listing) =>
+    sendMail({
+      to:      seller.email,
+      subject: `New inquiry on your listing: ${listing.title}`,
+      html:    base(`
+        <h2 style="color:#0f172a;">New Buyer Inquiry</h2>
+        <p style="color:#334155;">
+          <strong>${buyer.first_name} ${buyer.last_name}</strong> has sent an inquiry about
+          <strong>${listing.title}</strong>.
+        </p>
+        ${btn(`${FE}/messages`, 'View Inquiry')}
+      `),
+    }),
+
+  sendListingApproved: (seller, listing) =>
+    sendMail({
+      to:      seller.email,
+      subject: `Your listing is now live: ${listing.title}`,
+      html:    base(`
+        <h2 style="color:#0f172a;">🎉 Your listing is Live!</h2>
+        <p style="color:#334155;">
+          <strong>${listing.title}</strong> has been reviewed and is now visible to buyers on Compbuy.
+        </p>
+        ${btn(`${FE}/listings/${listing.slug}`, 'View Your Listing')}
+      `),
+    }),
+};
+
+'use strict';
+
+const jwt    = require('jsonwebtoken');
+const crypto = require('crypto');
+const { query } = require('../config/db');
+const logger = require('./logger');
+
+const ACCESS_SECRET  = process.env.JWT_SECRET;
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
+const ACCESS_TTL     = process.env.JWT_EXPIRES_IN         || '15m';
+const REFRESH_TTL    = process.env.JWT_REFRESH_EXPIRES_IN || '7d';
+
+if (!ACCESS_SECRET || !REFRESH_SECRET) {
+  logger.error('JWT secrets are not defined in environment variables.');
+  process.exit(1);
+}
+
+/**
+ * Sign a short-lived access token.
+ */
+function signAccessToken(payload) {
+  return jwt.sign(payload, ACCESS_SECRET, {
+    expiresIn: ACCESS_TTL,
+    issuer:    'compbuy.ng',
+    audience:  'compbuy-client',
+  });
+}
+
+/**
+ * Sign a long-lived refresh token and store its hash in the DB.
+ */
+async function signRefreshToken(userId, ip, userAgent) {
+  const token     = jwt.sign({ sub: userId }, REFRESH_SECRET, {
+    expiresIn: REFRESH_TTL,
+    issuer:    'compbuy.ng',
+    audience:  'compbuy-client',
+  });
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, ip_address, user_agent)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [userId, tokenHash, expiresAt, ip, userAgent]
+  );
+  return token;
+}
+
+/**
+ * Verify an access token, return decoded payload or throw.
+ */
+function verifyAccessToken(token) {
+  return jwt.verify(token, ACCESS_SECRET, {
+    issuer:   'compbuy.ng',
+    audience: 'compbuy-client',
+  });
+}
+
+/**
+ * Verify refresh token, check DB, return userId or throw.
+ */
+async function verifyRefreshToken(token) {
+  const decoded   = jwt.verify(token, REFRESH_SECRET, {
+    issuer:   'compbuy.ng',
+    audience: 'compbuy-client',
+  });
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const { rows }  = await query(
+    `SELECT id, user_id, revoked, expires_at
+     FROM refresh_tokens
+     WHERE token_hash = $1`,
+    [tokenHash]
+  );
+  if (!rows.length || rows[0].revoked || new Date(rows[0].expires_at) < new Date()) {
+    throw new Error('Invalid or expired refresh token');
+  }
+  return decoded.sub;
+}
+
+/**
+ * Revoke a single refresh token.
+ */
+async function revokeRefreshToken(token) {
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await query(`UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1`, [tokenHash]);
+}
+
+/**
+ * Revoke all refresh tokens for a user (e.g. on password change).
+ */
+async function revokeAllUserTokens(userId) {
+  await query(`UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1`, [userId]);
+}
+
+module.exports = {
+  signAccessToken,
+  signRefreshToken,
+  verifyAccessToken,
+  verifyRefreshToken,
+  revokeRefreshToken,
+  revokeAllUserTokens,
+};
+
+{
+  "name"; "compbuy-backend",
+  "version"; "1.0.0",
+  "description"; "Compbuy Business Marketplace - Secure REST API",
+  "main"; "src/server.js",
+  "scripts"; {
+    "start"; "node src/server.js",
+    "dev"; "nodemon src/server.js",
+    "migrate"; "node src/config/migrate.js",
+    "seed"; "node src/config/seed.js",
+    "test"; "jest --runInBand"
+  }
+  "dependencies"; {
+    "bcryptjs"; "^2.4.3",
+    "compression"; "^1.7.4",
+    "cookie-parser"; "^1.4.6",
+    "cors"; "^2.8.5",
+    "dotenv";"^16.3.1",
+    "express"; "^4.18.2",
+    "express-mongo-sanitize"; "^2.2.0",
+    "express-rate-limit"; "^7.1.5",
+    "helmet"; "^7.1.0",
+    "jsonwebtoken"; "^9.0.2",
+    "morgan"; "^1.10.0",
+    "multer"; "^1.4.5-lts.1",
+    "nodemailer"; "^6.9.7",
+    "pg"; "^8.11.3",
+    "uuid"; "^9.0.1",
+    "winston"; "^3.11.0",
+    "zod"; "^3.22.4",
+    "express-validator"; "^7.0.1",
+    "xss-clean"; "^0.1.4"
+  }
+  "devDependencies"; {
+    "jest"; "^29.7.0",
+    "nodemon"; "^3.0.2",
+    "supertest"; "^6.3.3"
+  }
+  "engines"; {
+    "node"; ">=18.0.0"
+  }
+}
+
+'use strict';
+
+const { createLogger, format, transports } = require('winston');
+const path = require('path');
+
+const { combine, timestamp, printf, colorize, errors } = format;
+
+const logFormat = printf(({ level, message, timestamp, stack, ...meta }) => {
+  const metaStr = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+  return `${timestamp} [${level}]: ${stack || message}${metaStr}`;
+});
+
+const logger = createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: combine(
+    errors({ stack: true }),
+    timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    logFormat
+  ),
+  transports: [
+    new transports.Console({
+      format: combine(colorize(), errors({ stack: true }), timestamp({ format: 'HH:mm:ss' }), logFormat),
+      silent: process.env.NODE_ENV === 'test',
+    }),
+    new transports.File({
+      filename: path.join('logs', 'error.log'),
+      level: 'error',
+      maxsize: 5 * 1024 * 1024,
+      maxFiles: 5,
+    }),
+    new transports.File({
+      filename: path.join('logs', 'combined.log'),
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 5,
+    }),
+  ],
+});
+
+module.exports = logger;
+
+
+
+'use strict';
+
+const { z } = require('zod');
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const password = z
+  .string()
+  .min(12, 'Password must be at least 12 characters')
+  .regex(/[A-Z]/, 'Must contain an uppercase letter')
+  .regex(/[a-z]/, 'Must contain a lowercase letter')
+  .regex(/[0-9]/, 'Must contain a number')
+  .regex(/[^A-Za-z0-9]/, 'Must contain a special character');
+
+const uuid = z.string().uuid('Invalid ID format');
+const positiveNum = (label) =>
+  z.number({ invalid_type_error: `${label} must be a number` }).positive(`${label} must be positive`);
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+const registerSchema = z.object({
+  first_name: z.string().min(2).max(100).trim(),
+  last_name:  z.string().min(2).max(100).trim(),
+  email:      z.string().email().toLowerCase().trim(),
+  password,
+  phone:      z.string().regex(/^\+?[0-9\s\-()]{7,20}$/).optional(),
+  role:       z.enum(['buyer', 'seller']),
+});
+
+const loginSchema = z.object({
+  email:    z.string().email().toLowerCase().trim(),
+  password: z.string().min(1),
+});
+
+const forgotPasswordSchema = z.object({
+  email: z.string().email().toLowerCase().trim(),
+});
+
+const resetPasswordSchema = z.object({
+  token:    z.string().min(1),
+  password,
+});
+
+const changePasswordSchema = z.object({
+  current_password: z.string().min(1),
+  new_password: password,
+});
+
+// ── Listings ──────────────────────────────────────────────────────────────────
+const createListingSchema = z.object({
+  title:             z.string().min(5).max(200).trim(),
+  description:       z.string().min(50).max(5000).trim(),
+  industry:          z.string().min(2).max(100).trim(),
+  sub_industry:      z.string().max(100).trim().optional(),
+  business_scale:    z.enum(['micro', 'small', 'medium', 'large', 'multinational']),
+  location:          z.string().min(3).max(200).trim(),
+  years_established: z.number().int().min(0).max(200).optional(),
+  employee_count:    z.number().int().min(0).optional(),
+  annual_revenue:    positiveNum('Annual revenue'),
+  net_profit:        z.number({ invalid_type_error: 'Net profit must be a number' }),
+  asking_price:      positiveNum('Asking price'),
+  reason_for_sale:   z.string().min(5).max(300).trim(),
+  assets_included:   z.string().max(2000).trim().optional(),
+  liabilities:       z.number().min(0).default(0),
+  inventory_value:   z.number().min(0).default(0),
+  currency:          z.string().length(3).default('NGN'),
+  cac_number:        z.string().max(50).trim().optional(),
+  firs_tin:          z.string().max(50).trim().optional(),
+  website_url:       z.string().url().optional().or(z.literal('')),
+});
+
+const updateListingSchema = createListingSchema.partial();
+
+const listingQuerySchema = z.object({
+  page:         z.coerce.number().int().min(1).default(1),
+  limit:        z.coerce.number().int().min(1).max(50).default(12),
+  industry:     z.string().optional(),
+  scale:        z.enum(['micro','small','medium','large','multinational']).optional(),
+  min_price:    z.coerce.number().min(0).optional(),
+  max_price:    z.coerce.number().min(0).optional(),
+  min_revenue:  z.coerce.number().min(0).optional(),
+  max_revenue:  z.coerce.number().min(0).optional(),
+  verified:     z.coerce.boolean().optional(),
+  featured:     z.coerce.boolean().optional(),
+  location:     z.string().optional(),
+  search:       z.string().max(200).optional(),
+  sort:         z.enum(['newest','oldest','price_asc','price_desc','revenue_desc','most_viewed']).default('newest'),
+});
+
+// ── Inquiries ─────────────────────────────────────────────────────────────────
+const createInquirySchema = z.object({
+  listing_id:   uuid,
+  subject:      z.string().min(5).max(200).trim(),
+  message:      z.string().min(20).max(3000).trim(),
+  inquiry_type: z.enum(['general','request_financials','schedule_call','submit_loi']).default('general'),
+});
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+const sendMessageSchema = z.object({
+  body: z.string().min(1).max(5000).trim(),
+});
+
+// ── Social Posts ──────────────────────────────────────────────────────────────
+const createPostSchema = z.object({
+  body:       z.string().min(1).max(3000).trim(),
+  listing_id: uuid.optional(),
+});
+
+// ── Profile ───────────────────────────────────────────────────────────────────
+const updateProfileSchema = z.object({
+  first_name:   z.string().min(2).max(100).trim().optional(),
+  last_name:    z.string().min(2).max(100).trim().optional(),
+  phone:        z.string().regex(/^\+?[0-9\s\-()]{7,20}$/).optional(),
+  bio:          z.string().max(1000).trim().optional(),
+  linkedin_url: z.string().url().optional().or(z.literal('')),
+});
+
+// ── Validate middleware factory ───────────────────────────────────────────────
+/**
+ * Returns an Express middleware that validates req.body (or req.query) with a Zod schema.
+ * @param {import('zod').ZodTypeAny} schema
+ * @param {'body'|'query'|'params'} [source='body']
+ */
+function validate(schema, source = 'body') {
+  return (req, res, next) => {
+    const result = schema.safeParse(req[source]);
+    if (!result.success) {
+      const errors = result.error.errors.map((e) => ({
+        field:   e.path.join('.'),
+        message: e.message,
+      }));
+      return res.status(422).json({ success: false, message: 'Validation failed', errors });
+    }
+    req[source] = result.data;
+    next();
+  };
+}
+
+module.exports = {
+  validate,
+  registerSchema,
+  loginSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  changePasswordSchema,
+  createListingSchema,
+  updateListingSchema,
+  listingQuerySchema,
+  createInquirySchema,
+  sendMessageSchema,
+  createPostSchema,
+  updateProfileSchema,
+};
+
+
+'use strict';
+
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const { query }                = require('../config/db');
+const { signAccessToken, signRefreshToken, verifyRefreshToken, revokeRefreshToken, revokeAllUserTokens } = require('../utils/jwt');
+const { sendVerificationEmail, sendPasswordResetEmail } = require('../utils/email');
+const { asyncHandler, AppError } = require('../middleware/errorHandler');
+const { auditLog }               = require('../middleware/security');
+const createLogger                    = require('../utils/logger');
+
+const SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS || '12', 10);
+const COOKIE_OPTS = {
+  httpOnly: true,
+  secure:   process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge:   7 * 24 * 60 * 60 * 1000,
+  path:     '/api/auth',
+};
+
+// ── Register ──────────────────────────────────────────────────────────────────
+exports.register = asyncHandler(async (req, res) => {
+  const { first_name, last_name, email, password, phone, role } = req.body;
+
+  const existing = await query('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.rows.length) throw new AppError('Email address is already registered', 409);
+
+  const password_hash  = await bcrypt.hash(password, SALT_ROUNDS);
+  const verify_token   = crypto.randomBytes(32).toString('hex');
+  const verify_expiry  = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  const { rows } = await query(
+    `INSERT INTO users
+       (first_name, last_name, email, password_hash, phone, role,
+        email_verify_token, email_verify_expiry)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     RETURNING id, first_name, last_name, email, role`,
+    [first_name, last_name, email, password_hash, phone || null, role, verify_token, verify_expiry]
+  );
+  const user = rows[0];
+
+  try { await sendVerificationEmail(user, verify_token); } catch (_) { /* non-fatal */ }
+
+  await auditLog({ actorId: user.id, action: 'USER_REGISTER', entityType: 'user', entityId: user.id, ip: req.ip });
+
+  res.status(201).json({
+    success: true,
+    message: 'Account created. Please check your email to verify your account.',
+    data: { id: user.id, email: user.email, role: user.role },
+  });
+});
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+exports.login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+
+  const { rows } = await query(
+    `SELECT id, email, first_name, last_name, role, password_hash,
+            is_active, email_verified, login_attempts, locked_until, verification_level
+     FROM users WHERE email = $1`,
+    [email]
+  );
+  const user = rows[0];
+
+  // Generic message prevents user enumeration
+  const INVALID = 'Invalid email or password';
+  if (!user || !user.is_active) throw new AppError(INVALID, 401);
+
+  // Account lock check
+  if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    throw new AppError('Account temporarily locked. Please try again later or reset your password.', 423);
+  }
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) {
+    const attempts = user.login_attempts + 1;
+    const lock     = attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
+    await query(
+      `UPDATE users SET login_attempts = $1, locked_until = $2 WHERE id = $3`,
+      [attempts, lock, user.id]
+    );
+    throw new AppError(INVALID, 401);
+  }
+
+  // Reset lockout
+  await query(`UPDATE users SET login_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE id = $1`, [user.id]);
+
+  const accessToken  = signAccessToken({ sub: user.id, role: user.role });
+  const refreshToken = await signRefreshToken(user.id, req.ip, req.headers['user-agent']);
+
+  res.cookie('refreshToken', refreshToken, COOKIE_OPTS);
+
+  await auditLog({ actorId: user.id, action: 'USER_LOGIN', entityType: 'user', entityId: user.id, ip: req.ip });
+
+  res.json({
+    success: true,
+    data: {
+      access_token: accessToken,
+      user: {
+        id: user.id, email: user.email,
+        first_name: user.first_name, last_name: user.last_name,
+        role: user.role, email_verified: user.email_verified,
+        verification_level: user.verification_level,
+      },
+    },
+  });
+});
+
+// ── Refresh Token ─────────────────────────────────────────────────────────────
+exports.refresh = asyncHandler(async (req, res) => {
+  const token = req.cookies?.refreshToken || req.body?.refresh_token;
+  if (!token) throw new AppError('Refresh token required', 401);
+
+  const userId = await verifyRefreshToken(token);
+  await revokeRefreshToken(token);
+
+  const { rows } = await query(`SELECT id, role, is_active FROM users WHERE id = $1`, [userId]);
+  if (!rows.length || !rows[0].is_active) throw new AppError('User not found', 401);
+
+  const newAccess  = signAccessToken({ sub: rows[0].id, role: rows[0].role });
+  const newRefresh = await signRefreshToken(rows[0].id, req.ip, req.headers['user-agent']);
+
+  res.cookie('refreshToken', newRefresh, COOKIE_OPTS);
+  res.json({ success: true, data: { access_token: newAccess } });
+});
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+exports.logout = asyncHandler(async (req, res) => {
+  const token = req.cookies?.refreshToken || req.body?.refresh_token;
+  if (token) {
+    try { await revokeRefreshToken(token); } catch (_) { /* expired is fine */ }
+  }
+  res.clearCookie('refreshToken', { path: '/api/auth' });
+  await auditLog({ actorId: req.user?.id, action: 'USER_LOGOUT', ip: req.ip });
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// ── Verify Email ──────────────────────────────────────────────────────────────
+exports.verifyEmail = asyncHandler(async (req, res) => {
+  const { token } = req.query;
+  if (!token) throw new AppError('Verification token is required', 400);
+
+  const { rows } = await query(
+    `UPDATE users
+     SET email_verified = TRUE, email_verify_token = NULL, email_verify_expiry = NULL,
+         verification_level = 'email_verified'
+     WHERE email_verify_token = $1 AND email_verify_expiry > NOW() AND email_verified = FALSE
+     RETURNING id, email`,
+    [token]
+  );
+  if (!rows.length) throw new AppError('Invalid or expired verification link', 400);
+
+  await auditLog({ actorId: rows[0].id, action: 'EMAIL_VERIFIED', entityType: 'user', entityId: rows[0].id, ip: req.ip });
+  res.json({ success: true, message: 'Email verified successfully. You can now log in.' });
+});
+
+// ── Forgot Password ───────────────────────────────────────────────────────────
+exports.forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  const { rows } = await query(`SELECT id, first_name, email FROM users WHERE email = $1`, [email]);
+
+  // Always respond 200 to prevent user enumeration
+  if (rows.length) {
+    const token   = crypto.randomBytes(32).toString('hex');
+    const expiry  = new Date(Date.now() + 60 * 60 * 1000);
+    await query(
+      `UPDATE users SET password_reset_token = $1, password_reset_expiry = $2 WHERE id = $3`,
+      [token, expiry, rows[0].id]
+    );
+    try { await sendPasswordResetEmail(rows[0], token); } catch (_) { /* non-fatal */ }
+  }
+
+  res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
+});
+
+// ── Reset Password ────────────────────────────────────────────────────────────
+exports.resetPassword = asyncHandler(async (req, res) => {
+  const { token, password } = req.body;
+
+  const { rows } = await query(
+    `SELECT id FROM users WHERE password_reset_token = $1 AND password_reset_expiry > NOW()`,
+    [token]
+  );
+  if (!rows.length) throw new AppError('Invalid or expired reset token', 400);
+
+  const hash = await bcrypt.hash(password, SALT_ROUNDS);
+  await query(
+    `UPDATE users
+     SET password_hash = $1, password_reset_token = NULL, password_reset_expiry = NULL,
+         login_attempts = 0, locked_until = NULL
+     WHERE id = $2`,
+    [hash, rows[0].id]
+  );
+  await revokeAllUserTokens(rows[0].id);
+  await auditLog({ actorId: rows[0].id, action: 'PASSWORD_RESET', entityType: 'user', entityId: rows[0].id, ip: req.ip });
+
+  res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
+});
+
+// ── Change Password ───────────────────────────────────────────────────────────
+exports.changePassword = asyncHandler(async (req, res) => {
+  const { current_password, new_password } = req.body;
+
+  const { rows } = await query(`SELECT password_hash FROM users WHERE id = $1`, [req.user.id]);
+  const valid = await bcrypt.compare(current_password, rows[0].password_hash);
+  if (!valid) throw new AppError('Current password is incorrect', 400);
+
+  const hash = await bcrypt.hash(new_password, SALT_ROUNDS);
+  await query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [hash, req.user.id]);
+  await revokeAllUserTokens(req.user.id);
+  await auditLog({ actorId: req.user.id, action: 'PASSWORD_CHANGE', entityType: 'user', entityId: req.user.id, ip: req.ip });
+
+  res.clearCookie('refreshToken', { path: '/api/auth' });
+  res.json({ success: true, message: 'Password changed. Please log in again.' });
+});
+
+// ── Get Me ────────────────────────────────────────────────────────────────────
+exports.getMe = asyncHandler(async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, email, first_name, last_name, phone, role, verification_level,
+            email_verified, bio, linkedin_url, avatar_url, two_fa_enabled,
+            last_login_at, created_at
+     FROM users WHERE id = $1`,
+    [req.user.id]
+  );
+  res.json({ success: true, data: rows[0] });
+});
+
+
+
+'use strict';
+
+const { verifyAccessToken } = require('../utils/jwt');
+const { query }             = require('../config/db');
+const createLogger                = require('../utils/logger');
+
+/**
+ * Attach the authenticated user to req.user.
+ * Expects: Authorization: Bearer <access_token>
+ */
+async function authenticate(req, res, next) {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    const token   = header.split(' ')[1];
+    const decoded = verifyAccessToken(token);
+
+    const { rows } = await query(
+      `SELECT id, email, first_name, last_name, role, is_active, email_verified, verification_level
+       FROM users WHERE id = $1`,
+      [decoded.sub]
+    );
+
+    if (!rows.length || !rows[0].is_active) {
+      return res.status(401).json({ success: false, message: 'User not found or deactivated' });
+    }
+
+    req.user = rows[0];
+    next();
+  } catch (err) {
+    logger.warn('Authentication failed', { error: err.message, ip: req.ip });
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, message: 'Access token expired', code: 'TOKEN_EXPIRED' });
+    }
+    return res.status(401).json({ success: false, message: 'Invalid token' });
+  }
+}
+
+/**
+ * Restrict to specific roles.
+ * Usage: authorize('admin') or authorize('seller', 'admin')
+ */
+function authorize(...roles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'Not authenticated' });
+    }
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: `Access denied. Required role(s): ${roles.join(', ')}`,
+      });
+    }
+    next();
+  };
+}
+
+/**
+ * Require email to be verified before proceeding.
+ */
+function requireEmailVerified(req, res, next) {
+  if (!req.user?.email_verified) {
+    return res.status(403).json({
+      success: false,
+      message: 'Please verify your email address before performing this action.',
+      code: 'EMAIL_NOT_VERIFIED',
+    });
+  }
+  next();
+}
+
+/**
+ * Optional auth — attaches user if token present but does NOT block unauthenticated.
+ */
+async function optionalAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization;
+    if (header && header.startsWith('Bearer ')) {
+      const token   = header.split(' ')[1];
+      const decoded = verifyAccessToken(token);
+      const { rows } = await query(
+        `SELECT id, email, first_name, last_name, role FROM users WHERE id = $1 AND is_active = TRUE`,
+        [decoded.sub]
+      );
+      if (rows.length) req.user = rows[0];
+    }
+  } catch (_) { /* no-op */ }
+  next();
+}
+
+module.exports = { authenticate, authorize, requireEmailVerified, optionalAuth };
+
+
+'use strict';
+/**
+ * COMPBUY — Database Migration
+ * Run: node src/config/migrate.js
+ * Creates all tables from scratch (idempotent via IF NOT EXISTS).
+ */
+
+require('dotenv').config();
+const { pool } = require('./db');
+const createLogger   = require('../utils/logger');
+
+const SQL = /* sql */`
+
+-- ── Extensions ────────────────────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ── ENUM types ────────────────────────────────────────────────────────────────
+DO $$ BEGIN
+  CREATE TYPE user_role        AS ENUM ('buyer', 'seller', 'admin');
+  CREATE TYPE listing_status   AS ENUM ('draft', 'pending_review', 'live', 'sold', 'withdrawn');
+  CREATE TYPE business_scale   AS ENUM ('micro', 'small', 'medium', 'large', 'multinational');
+  CREATE TYPE inquiry_status   AS ENUM ('open', 'responded', 'closed');
+  CREATE TYPE verification_lvl AS ENUM ('unverified', 'email_verified', 'id_verified', 'financials_verified');
+  CREATE TYPE message_status   AS ENUM ('sent', 'delivered', 'read');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- ── users ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS users (
+  id                  UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email               VARCHAR(255)  NOT NULL UNIQUE,
+  password_hash       TEXT          NOT NULL,
+  first_name          VARCHAR(100)  NOT NULL,
+  last_name           VARCHAR(100)  NOT NULL,
+  phone               VARCHAR(30),
+  role                user_role     NOT NULL DEFAULT 'buyer',
+  verification_level  verification_lvl NOT NULL DEFAULT 'unverified',
+  is_active           BOOLEAN       NOT NULL DEFAULT TRUE,
+  email_verified      BOOLEAN       NOT NULL DEFAULT FALSE,
+  email_verify_token  TEXT,
+  email_verify_expiry TIMESTAMPTZ,
+  password_reset_token  TEXT,
+  password_reset_expiry TIMESTAMPTZ,
+  avatar_url          TEXT,
+  bio                 TEXT,
+  linkedin_url        TEXT,
+  two_fa_secret       TEXT,
+  two_fa_enabled      BOOLEAN       NOT NULL DEFAULT FALSE,
+  last_login_at       TIMESTAMPTZ,
+  login_attempts      SMALLINT      NOT NULL DEFAULT 0,
+  locked_until        TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_role  ON users(role);
+
+-- ── refresh_tokens ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash  TEXT        NOT NULL UNIQUE,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  revoked     BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ip_address  INET,
+  user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+
+-- ── listings ──────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS listings (
+  id                UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+  seller_id         UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title             VARCHAR(200)  NOT NULL,
+  slug              VARCHAR(220)  NOT NULL UNIQUE,
+  description       TEXT          NOT NULL,
+  industry          VARCHAR(100)  NOT NULL,
+  sub_industry      VARCHAR(100),
+  business_scale    business_scale NOT NULL,
+  location          VARCHAR(200)  NOT NULL,
+  years_established SMALLINT,
+  employee_count    INTEGER,
+  annual_revenue    NUMERIC(20,2) NOT NULL,
+  net_profit        NUMERIC(20,2) NOT NULL,
+  asking_price      NUMERIC(20,2) NOT NULL,
+  reason_for_sale   VARCHAR(300)  NOT NULL,
+  assets_included   TEXT,
+  liabilities       NUMERIC(20,2) DEFAULT 0,
+  inventory_value   NUMERIC(20,2) DEFAULT 0,
+  status            listing_status NOT NULL DEFAULT 'pending_review',
+  is_featured       BOOLEAN       NOT NULL DEFAULT FALSE,
+  is_verified       BOOLEAN       NOT NULL DEFAULT FALSE,
+  view_count        INTEGER       NOT NULL DEFAULT 0,
+  inquiry_count     INTEGER       NOT NULL DEFAULT 0,
+  currency          CHAR(3)       NOT NULL DEFAULT 'NGN',
+  cac_number        VARCHAR(50),
+  firs_tin          VARCHAR(50),
+  website_url       TEXT,
+  rejection_reason  TEXT,
+  published_at      TIMESTAMPTZ,
+  expires_at        TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_listings_seller     ON listings(seller_id);
+CREATE INDEX IF NOT EXISTS idx_listings_status     ON listings(status);
+CREATE INDEX IF NOT EXISTS idx_listings_industry   ON listings(industry);
+CREATE INDEX IF NOT EXISTS idx_listings_price      ON listings(asking_price);
+CREATE INDEX IF NOT EXISTS idx_listings_created    ON listings(created_at DESC);
+
+-- Full-text search vector
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS search_vector TSVECTOR;
+CREATE INDEX IF NOT EXISTS idx_listings_fts ON listings USING GIN(search_vector);
+
+CREATE OR REPLACE FUNCTION listings_search_vector_update() RETURNS TRIGGER AS $$
+BEGIN
+  NEW.search_vector :=
+    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(NEW.industry, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.description, '')), 'C') ||
+    setweight(to_tsvector('english', coalesce(NEW.location, '')), 'D');
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS listings_search_vector_trigger ON listings;
+CREATE TRIGGER listings_search_vector_trigger
+  BEFORE INSERT OR UPDATE ON listings
+  FOR EACH ROW EXECUTE FUNCTION listings_search_vector_update();
+
+-- ── listing_images ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS listing_images (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  listing_id  UUID        NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  url         TEXT        NOT NULL,
+  caption     VARCHAR(200),
+  is_primary  BOOLEAN     NOT NULL DEFAULT FALSE,
+  sort_order  SMALLINT    NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── listing_documents ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS listing_documents (
+  id           UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  listing_id   UUID        NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  uploaded_by  UUID        NOT NULL REFERENCES users(id),
+  doc_type     VARCHAR(80) NOT NULL,  -- e.g. 'audited_accounts', 'tax_returns', 'nafdac_cert'
+  file_name    VARCHAR(255) NOT NULL,
+  file_path    TEXT        NOT NULL,
+  file_size    INTEGER,
+  mime_type    VARCHAR(80),
+  is_public    BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── inquiries ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS inquiries (
+  id           UUID           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  listing_id   UUID           NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  buyer_id     UUID           NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  seller_id    UUID           NOT NULL REFERENCES users(id),
+  subject      VARCHAR(200)   NOT NULL,
+  message      TEXT           NOT NULL,
+  inquiry_type VARCHAR(80)    NOT NULL DEFAULT 'general',
+  status       inquiry_status NOT NULL DEFAULT 'open',
+  nda_signed   BOOLEAN        NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+  UNIQUE(listing_id, buyer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inquiries_listing ON inquiries(listing_id);
+CREATE INDEX IF NOT EXISTS idx_inquiries_buyer   ON inquiries(buyer_id);
+CREATE INDEX IF NOT EXISTS idx_inquiries_seller  ON inquiries(seller_id);
+
+-- ── messages (thread replies) ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS messages (
+  id           UUID           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  inquiry_id   UUID           NOT NULL REFERENCES inquiries(id) ON DELETE CASCADE,
+  sender_id    UUID           NOT NULL REFERENCES users(id),
+  body         TEXT           NOT NULL,
+  status       message_status NOT NULL DEFAULT 'sent',
+  is_system    BOOLEAN        NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_messages_inquiry ON messages(inquiry_id);
+CREATE INDEX IF NOT EXISTS idx_messages_sender  ON messages(sender_id);
+
+-- ── watchlist ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS watchlist (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  listing_id  UUID        NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id, listing_id)
+);
+
+-- ── social_posts ──────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS social_posts (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  author_id   UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body        TEXT        NOT NULL,
+  listing_id  UUID        REFERENCES listings(id) ON DELETE SET NULL,
+  like_count  INTEGER     NOT NULL DEFAULT 0,
+  comment_count INTEGER   NOT NULL DEFAULT 0,
+  is_pinned   BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_posts_author  ON social_posts(author_id);
+CREATE INDEX IF NOT EXISTS idx_posts_created ON social_posts(created_at DESC);
+
+-- ── post_likes ────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS post_likes (
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  post_id    UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, post_id)
+);
+
+-- ── post_comments ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS post_comments (
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  post_id    UUID        NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+  author_id  UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body       TEXT        NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON post_comments(post_id);
+
+-- ── audit_log ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS audit_log (
+  id          UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  actor_id    UUID        REFERENCES users(id),
+  action      VARCHAR(80) NOT NULL,
+  entity_type VARCHAR(80),
+  entity_id   UUID,
+  metadata    JSONB,
+  ip_address  INET,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_log(actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
+
+-- ── updated_at triggers ───────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END $$ LANGUAGE plpgsql;
+
+DO $$ DECLARE t TEXT;
+BEGIN FOR t IN SELECT unnest(ARRAY['users','listings','inquiries','social_posts']) LOOP
+  EXECUTE format(
+    'DROP TRIGGER IF EXISTS trg_updated_at ON %I;
+     CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I
+     FOR EACH ROW EXECUTE FUNCTION set_updated_at();', t, t);
+END LOOP; END $$;
+
+`;
+
+(async () => {
+  const client = await pool.connect();
+  try {
+    logger.info('Running Compbuy migrations…');
+    await client.query(SQL);
+    logger.info('Migrations completed successfully.');
+  } catch (err) {
+    logger.error('Migration failed', { error: err.message });
+    process.exit(1);
+  } finally {
+    client.release();
+    await pool.end();
+  }
+})();
+
+
+'use strict';
+
+const createLogger = require('../utils/logger');
+
+/**
+ * Wrap async route handlers to catch thrown errors and pass to next().
+ */
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+/**
+ * Global error handler — must be registered last in Express.
+ */
+function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-vars
+  let statusCode = err.statusCode || err.status || 500;
+  let message    = err.message    || 'Internal Server Error';
+
+  // PostgreSQL unique violation
+  if (err.code === '23505') {
+    statusCode = 409;
+    message = 'A record with this value already exists';
+    const field = err.detail?.match(/\((.+?)\)/)?.[1];
+    if (field) message = `${field} is already in use`;
+  }
+
+  // PostgreSQL foreign key violation
+  if (err.code === '23503') {
+    statusCode = 400;
+    message = 'Referenced record does not exist';
+  }
+
+  // JWT errors
+  if (err.name === 'JsonWebTokenError')  { statusCode = 401; message = 'Invalid token'; }
+  if (err.name === 'TokenExpiredError')  { statusCode = 401; message = 'Token expired'; }
+
+  if (statusCode >= 500) {
+    logger.error('Unhandled error', {
+      message: err.message,
+      stack: err.stack,
+      url: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+    });
+  }
+
+  res.status(statusCode).json({
+    success: false,
+    message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  });
+}
+
+/**
+ * 404 handler for unmatched routes.
+ */
+function notFound(req, res) {
+  res.status(404).json({ success: false, message: `Route ${req.method} ${req.originalUrl} not found` });
+}
+
+/**
+ * Create a standardised API error with a status code.
+ */
+class AppError extends Error {
+  constructor(message, statusCode = 500) {
+    super(message);
+    this.statusCode = statusCode;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+module.exports = { asyncHandler, errorHandler, notFound, AppError };
+
+
+
+'use strict';
+
+const rateLimit = require('express-rate-limit');
+const multer    = require('multer');
+const path      = require('path');
+const crypto    = require('crypto');
+const fs        = require('fs');
+const createLogger    = require('../utils/logger');
+
+// ── Rate Limiters ─────────────────────────────────────────────────────────────
+const defaultLimiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10),
+  max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
+const authLimiter = rateLimit({
+  windowMs:    15 * 60 * 1000,
+  max:         parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10', 10),
+  standardHeaders: true,
+  legacyHeaders:   false,
+  skipSuccessfulRequests: true,
+  message: { success: false, message: 'Too many authentication attempts. Please wait 15 minutes.' },
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: { success: false, message: 'Upload limit reached for this hour.' },
+});
+
+// ── Multer File Upload ────────────────────────────────────────────────────────
+const UPLOAD_DIR   = process.env.UPLOAD_DIR || 'uploads';
+const MAX_SIZE_MB  = parseInt(process.env.MAX_FILE_SIZE_MB || '10', 10);
+const ALLOWED_IMG  = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_DOC  = ['application/pdf', 'image/jpeg', 'image/png'];
+
+// Ensure upload directory exists
+['images','documents'].forEach(sub => {
+  const dir = path.join(UPLOAD_DIR, sub);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const isDoc = ALLOWED_DOC.includes(file.mimetype) && !ALLOWED_IMG.includes(file.mimetype);
+    cb(null, path.join(UPLOAD_DIR, isDoc ? 'documents' : 'images'));
+  },
+  filename: (req, file, cb) => {
+    const ext  = path.extname(file.originalname).toLowerCase();
+    const name = crypto.randomBytes(16).toString('hex');
+    cb(null, `${name}${ext}`);
+  },
+});
+
+function fileFilter(allowedTypes) {
+  return (req, file, cb) => {
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Invalid file type. Allowed: ${allowedTypes.join(', ')}`), false);
+    }
+  };
+}
+
+const uploadImage = multer({
+  storage,
+  limits: { fileSize: MAX_SIZE_MB * 1024 * 1024, files: 5 },
+  fileFilter: fileFilter(ALLOWED_IMG),
+});
+
+const uploadDocument = multer({
+  storage,
+  limits: { fileSize: MAX_SIZE_MB * 1024 * 1024, files: 3 },
+  fileFilter: fileFilter(ALLOWED_DOC),
+});
+
+// ── Audit Log helper ──────────────────────────────────────────────────────────
+const { query } = require('../config/db');
+async function auditLog({ actorId, action, entityType, entityId, metadata, ip }) {
+  try {
+    await query(
+      `INSERT INTO audit_log (actor_id, action, entity_type, entity_id, metadata, ip_address)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [actorId, action, entityType, entityId, metadata ? JSON.stringify(metadata) : null, ip]
+    );
+  } catch (err) {
+    logger.error('Audit log failed', { err: err.message });
+  }
+}
+
+module.exports = { defaultLimiter, authLimiter, uploadLimiter, uploadImage, uploadDocument, auditLog };
+
